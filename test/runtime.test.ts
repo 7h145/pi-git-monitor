@@ -1,11 +1,12 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext, ExecResult } from "@earendil-works/pi-coding-agent";
+import { readStatus } from "../src/git.ts";
 import { setup } from "../pi-git-monitor.ts";
 import { fakeDependencies, clean, deferred, flush } from "./helpers.ts";
 function fixture(t: TestContext, mode = "tui", root?: string) {
 	const deps = fakeDependencies();
-	const handlers = new Map<string, (event: any, ctx: ExtensionContext) => void>();
+	const handlers = new Map<string, (event: any, ctx: ExtensionContext) => void | Promise<void>>();
 	const commands = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>();
 	const flags = new Map<string, unknown>();const views: string[][] = [];
 	const statuses = new Map<string, string | undefined>();const notifications: string[] = [];
@@ -26,7 +27,9 @@ function fixture(t: TestContext, mode = "tui", root?: string) {
 		registerCommand: (name: string, command: any) => commands.set(name, command),
 		registerFlag: (name: string, flag: unknown) => flags.set(name, flag),
 		getFlag: (name: string) => name === "git-monitor-root" ? root : undefined } as unknown as ExtensionAPI;
-	setup(api, deps);
+	// Keep test overrides live while production setup captures its dependencies.
+	setup(api, { exec: (...args) => deps.exec(...args), discover: (...args) => deps.discover(...args),
+		readStatus: (...args) => deps.readStatus(...args), probe: (...args) => deps.probe(...args) });
 	t.after(() => handlers.get("session_shutdown")!({}, ctx));
 	return { ctx, deps, statuses, notifications, handlers, commands, flags, views,
 		start: () => handlers.get("session_start")!({}, ctx),
@@ -149,4 +152,90 @@ test("status and s print the same report, view and v render the same snapshot", 
 	const f = fixture(t);
 	await f.command("status");await f.command("s");assert.equal(f.notifications[0], f.notifications[1]);
 	await f.command("view");await f.command("v");assert.deepEqual(f.views[0], f.views[1]);
+});
+
+test("shutdown releases request waiters but awaits the underlying execution", async t => {
+	const f = fixture(t), pending = deferred<ExecResult>();let signal: AbortSignal | undefined;
+	f.deps.readStatus = readStatus;
+	f.deps.exec = (_command, _args, options) => { signal = options?.signal;return pending.promise; };
+	f.start();await flush();assert.ok(signal);
+	let done = false;
+	const shutdown = Promise.resolve(f.handlers.get("session_shutdown")!({}, f.ctx)).then(() => { done = true; });
+	try {
+		await flush();assert.equal(signal.aborted, true);assert.equal(done, false);
+		assert.equal(f.status(), undefined);
+		pending.resolve({ code: 0, stdout: "", stderr: "", killed: true });
+		await shutdown;assert.equal(done, true);
+		await f.handlers.get("session_shutdown")!({}, f.ctx);
+		assert.equal(f.status(), undefined);
+	} finally { pending.resolve({ code: 1, stdout: "", stderr: "", killed: true });await shutdown; }
+});
+
+test("expired requests retain execution slots and remain owned at shutdown", async t => {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	const f = fixture(t), jobs: ReturnType<typeof deferred<ExecResult>>[] = [];
+	f.deps.readStatus = readStatus;
+	f.deps.exec = () => { const job = deferred<ExecResult>();jobs.push(job);return job.promise; };
+	let shutdown: Promise<void> | undefined;
+	try {
+		f.start();await flush();assert.equal(jobs.length, 1);
+		t.mock.timers.tick(2_000);await flush();
+		const second = f.command("status");await flush();assert.equal(jobs.length, 2);
+		t.mock.timers.tick(2_000);await second;
+		const third = f.command("status");await flush();
+		assert.equal(jobs.length, 2, "timed-out executions still occupy both slots");
+		t.mock.timers.tick(2_000);await third;
+		let done = false;
+		shutdown = Promise.resolve(f.handlers.get("session_shutdown")!({}, f.ctx)).then(() => { done = true; });
+		await flush();assert.equal(done, false);
+		jobs[0].resolve({ code: 1, stdout: "", stderr: "", killed: true });
+		await flush();assert.equal(done, false);assert.equal(jobs.length, 2);
+		jobs[1].resolve({ code: 1, stdout: "", stderr: "", killed: true });
+		await shutdown;assert.equal(done, true);assert.equal(jobs.length, 2);
+	} finally {
+		for (const job of jobs) job.resolve({ code: 1, stdout: "", stderr: "", killed: true });
+		await shutdown;
+	}
+});
+
+test("shutdown also drains executions belonging to replaced sessions", async t => {
+	const f = fixture(t), jobs: ReturnType<typeof deferred<ExecResult>>[] = [], signals: AbortSignal[] = [];
+	f.deps.readStatus = readStatus;
+	f.deps.exec = (_command, _args, options) => {
+		signals.push(options!.signal!);const job = deferred<ExecResult>();jobs.push(job);return job.promise;
+	};
+	let shutdown: Promise<void> | undefined;
+	try {
+		f.start();await flush();f.start();await flush();
+		assert.equal(jobs.length, 2);assert.equal(signals[0].aborted, true);
+		let done = false;
+		shutdown = Promise.resolve(f.handlers.get("session_shutdown")!({}, f.ctx)).then(() => { done = true; });
+		assert.equal(signals[1].aborted, true);
+		jobs[1].resolve({ code: 1, stdout: "", stderr: "", killed: true });
+		await flush();assert.equal(done, false, "the old session's execution is still outstanding");
+		jobs[0].resolve({ code: 1, stdout: "", stderr: "", killed: true });
+		await shutdown;assert.equal(done, true);assert.equal(f.status(), undefined);
+	} finally {
+		for (const job of jobs) job.resolve({ code: 1, stdout: "", stderr: "", killed: true });
+		await shutdown;
+	}
+});
+
+test("status cleanup errors cannot bypass execution draining", async t => {
+	const f = fixture(t), pending = deferred<ExecResult>();
+	f.deps.readStatus = readStatus;f.deps.exec = () => pending.promise;
+	f.start();await flush();
+	const setStatus = f.ctx.ui.setStatus;
+	f.ctx.ui.setStatus = () => { throw new Error("UI already stopped"); };
+	let done = false;
+	const rejected = assert.rejects(Promise.resolve(f.handlers.get("session_shutdown")!({}, f.ctx)), /UI already stopped/)
+		.then(() => { done = true; });
+	try {
+		await flush();assert.equal(done, false);
+		pending.resolve({ code: 1, stdout: "", stderr: "", killed: true });
+		await rejected;assert.equal(done, true);
+	} finally {
+		f.ctx.ui.setStatus = setStatus;
+		pending.resolve({ code: 1, stdout: "", stderr: "", killed: true });await rejected;
+	}
 });

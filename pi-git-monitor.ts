@@ -16,6 +16,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { resolve } from "node:path";
 import { dependencies, WorkspaceSession, type Dependencies } from "./src/session.ts";
+import { GitExecutions } from "./src/execution.ts";
 import { details, overview, summary } from "./src/format.ts";
 import { WorkspaceView } from "./src/view.ts";
 
@@ -31,6 +32,9 @@ export default function gitMonitor(pi: ExtensionAPI) { setup(pi, dependencies(pi
 
 /** Dependency injection is used only by the regression tests. */
 export function setup(pi: ExtensionAPI, deps: Dependencies) {
+	// This owner outlives individual sessions and their request waiters.
+	const executions = new GitExecutions(deps.exec);
+	const sessionDeps = { ...deps, exec: executions.exec };
 	let session: WorkspaceSession | undefined;
 	let latestCtx: ExtensionContext | undefined;
 	let displayTimer: ReturnType<typeof setInterval> | undefined;
@@ -71,7 +75,7 @@ export function setup(pi: ExtensionAPI, deps: Dependencies) {
 			rootResolved = true;
 		}
 		latestCtx = ctx;
-		const current = new WorkspaceSession(ctx.cwd, configuredRoot, deps, () => {
+		const current = new WorkspaceSession(ctx.cwd, configuredRoot, sessionDeps, () => {
 			if (session === current && latestCtx) publish(latestCtx);
 		});
 		session = current;
@@ -114,11 +118,15 @@ export function setup(pi: ExtensionAPI, deps: Dependencies) {
 		if (!event.isError && ["write", "edit", "bash", "codemode"].includes(event.toolName)) schedule(ctx);
 	});
 	pi.on("agent_settled", (_event, ctx) => schedule(ctx));
-	pi.on("session_shutdown", (_event, ctx) => {
+	pi.on("session_shutdown", async (_event, ctx) => {
 		dispose();
-		if (ctx.mode === "tui") {
-			ctx.ui.setStatus(LEFT_KEY, undefined);
-			ctx.ui.setStatus(RIGHT_KEY, undefined);
+		try {
+			if (ctx.mode === "tui") {
+				ctx.ui.setStatus(LEFT_KEY, undefined);
+				ctx.ui.setStatus(RIGHT_KEY, undefined);
+			}
+		} finally {
+			await executions.drain();
 		}
 	});
 

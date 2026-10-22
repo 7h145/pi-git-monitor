@@ -193,12 +193,22 @@ Polls reuse the discovered repository list. Startup and manual commands repeat
 discovery; if initial discovery fails entirely, polling retries it until a list
 is available.
 
-At most two repository status requests run concurrently. Git requests have a
-two-second waiting deadline; interrupted, failed or malformed results are not
-presented as clean. Background failures do not produce repeated notifications.
+At most two Git executions remain outstanding per loaded extension, including
+executions whose requests have already timed out or whose sessions were replaced.
+Git requests have a two-second waiting deadline, including any wait for an
+execution slot; interrupted, failed or malformed results are not presented as
+clean. Background failures do not produce repeated notifications.
+
 Each session owns its queue and cached data. Shutdown, replacement and reload
 abort pending Git requests, release waiting commands and suppress late output.
-A pending filesystem probe can still finish its cleanup afterward.
+The shutdown handler also waits for the underlying executions to finish, so Pi
+can reap its Git children before exiting or unloading the extension. This includes
+executions left outstanding by earlier deadlines or replaced sessions. A pending
+filesystem probe can still finish its cleanup afterward.
+
+The two-second request deadline is not a shutdown deadline. If Git or Pi's
+execution helper does not finish after cancellation, shutdown can remain waiting.
+Forcibly terminating Pi can bypass cleanup and leave orphaned children.
 
 Filesystem operations are subject to the filesystem's own responsiveness; the
 Git deadline is not a deadline for the entire workspace refresh. Large worktrees
@@ -246,14 +256,18 @@ npm run check
 ```
 
 `check` runs strict TypeScript checks and Node's regression tests. Tests use
-disposable local Git repositories and synthetic failures; they do not fetch or
-contact a model provider. CI runs these checks on Node.js 24 with Pi SDKs 1.0.2
+disposable local Git repositories, Pi's execution helper and synthetic failures;
+they do not fetch or contact a model provider. Disposable commits disable automatic
+maintenance to avoid detached background jobs. The Linux process-lifecycle test
+uses `mkfifo` from coreutils to hold a Git request pending during shutdown; it is
+skipped on other platforms. CI runs these checks on Node.js 24 with Pi SDKs 1.0.2
 and 1.1.0.
 
 The entry point registers flags, commands and lifecycle hooks. `src/discovery.ts`
 owns workspace scope and configuration, `src/git.ts` collects and parses Git
-status, `src/session.ts` owns requests and cancellation, and `src/view.ts` renders
-the read-only snapshot. `src/probe.ts` limits cleanup to probes it created.
+status, `src/execution.ts` retains and limits underlying executions across
+sessions, `src/session.ts` owns requests and cancellation, and `src/view.ts`
+renders the read-only snapshot. `src/probe.ts` limits cleanup to probes it created.
 
 ## Last confirmed working
 

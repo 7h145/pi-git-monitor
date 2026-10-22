@@ -19,7 +19,8 @@ export async function temporary(t: TestContext) {
 	return root;
 }
 export async function git(root: string, ...args: string[]) {
-	const result = await exec("git", ["-C", root, ...args]);
+	// Disposable commits must not launch detached maintenance processes.
+	const result = await exec("git", ["-c", "maintenance.auto=false", "-C", root, ...args]);
 	if (result.code) throw new Error(result.stderr);
 	return result.stdout;
 }
